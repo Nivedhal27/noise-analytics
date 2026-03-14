@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Advanced Sound Monitor with NPI & Heatmap</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: #0f0f0f; 
+            color: #e0e0e0; 
+            margin: 0;
+            padding: 20px;
+        }
+        h1 { color: #ffffff; margin-bottom: 30px; text-align: center; }
+        
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 20px;
+            max-width: 1200px;
+            margin: auto;
+        }
+
+        .chart-container { 
+            background: #1e1e1e; 
+            padding: 25px; 
+            border-radius: 15px; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+
+        .controls-panel {
+            background: #252525;
+            padding: 20px;
+            border-radius: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+
+        /* Diagnostic & Heatmap Styles */
+        .diagnostic-card { background: #333; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #444; }
+        .problem-room-text { font-size: 1.4rem; font-weight: bold; margin-top: 5px; display: block; }
+        
+        .heatmap-container { margin-top: 20px; background: #1e1e1e; padding: 15px; border-radius: 15px; }
+        .time-axis { position: relative; width: 100%; height: 30px; background: #333; border-radius: 5px; margin: 10px 0; overflow: hidden; }
+        .noise-tick { position: absolute; width: 3px; height: 100%; box-shadow: 0 0 5px currentColor; }
+        .time-labels { display: flex; justify-content: space-between; font-size: 0.7rem; color: #888; }
+
+        .history-container { max-width: 1200px; margin: 30px auto; background: #1e1e1e; padding: 20px; border-radius: 15px; max-height: 400px; overflow-y: auto; }
+        .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+
+        table { width: 100%; border-collapse: collapse; text-align: left; }
+        th { border-bottom: 2px solid #444; padding: 10px; color: #888; }
+        td { padding: 10px; border-bottom: 1px solid #333; }
+        
+        .btn-download { background: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; }
+        .alert-card { padding: 15px; border-radius: 8px; text-align: center; font-weight: bold; background: #333; }
+        .alert-active { background: #721c24 !important; color: #f8d7da !important; animation: pulse 1s infinite; }
+
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.02); } 100% { transform: scale(1); } }
+        .stat-value { font-size: 1.5rem; color: cyan; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>🔊 Simultaneous Sound Monitoring</h1>
+    
+    <div class="dashboard-grid">
+        <div class="chart-container">
+            <canvas id="liveChart"></canvas>
+            
+            <div class="heatmap-container">
+                <small style="color:#888">LIVE ACTIVITY HEATMAP (CYAN: A | MAGENTA: B)</small>
+                <div class="time-axis" id="heatmapAxis"></div>
+                <div class="time-labels"><span>12 AM</span><span>12 PM</span><span>12 AM</span></div>
+            </div>
+        </div>
+
+        <div class="controls-panel">
+            <div id="statusAlert" class="alert-card">SYSTEM CALIBRATED</div>
+            
+            <div class="diagnostic-card">
+                <small style="color: #888; text-transform: uppercase;">Primary Noise Source</small>
+                <span id="conclusionText" class="problem-room-text" style="color: #555;">NONE</span>
+            </div>
+
+            <div>
+                <label style="color:#888">Threshold Control</label>
+                <input type="range" id="thresholdSlider" min="0" max="1000" value="400" oninput="updateThreshold(this.value)" style="width: 100%;">
+                <div style="text-align: center; color: #ffcc00; font-weight: bold; font-size: 1.2rem;" id="thresholdDisplay">400</div>
+            </div>
+            <hr style="border: 0; border-top: 1px solid #444;">
+            <div><small>Peak Room A</small><br><span id="peakA" class="stat-value">0</span></div>
+            <div><small>Peak Room B</small><br><span id="peakB" class="stat-value" style="color: magenta;">0</span></div>
+            <div style="font-size: 0.8rem; color: #888;">Violations: <span id="countA" style="color:cyan">0</span> | <span id="countB" style="color:magenta">0</span></div>
+        </div>
+    </div>
+
+    <div class="history-container">
+        <div class="header-flex">
+            <h3>Alert History Log</h3>
+            <button class="btn-download" onclick="downloadCSV()">📥 Download Teacher's Report (CSV)</button>
+        </div>
+        <table id="alertTable">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Room</th>
+                    <th>Noise Level</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="historyBody"></tbody>
+        </table>
+    </div>
+
+    <script>
+        const socket = io();
+        let currentThreshold = 400;
+        let maxA = 0, maxB = 0;
+        let violationsA = 0, violationsB = 0;
+        let lastAlertTime = 0;
+        let dataSession = []; // Stores all data for the final CSV
+
+        function updateThreshold(val) {
+            currentThreshold = val;
+            document.getElementById('thresholdDisplay').innerText = val;
+        }
+
+        function downloadCSV() {
+            const avgA = Math.round(dataSession.reduce((acc, val) => acc + val.a, 0) / dataSession.length || 0);
+            const avgB = Math.round(dataSession.reduce((acc, val) => acc + val.b, 0) / dataSession.length || 0);
+            const verdict = violationsA > violationsB ? "CLASSROOM A" : (violationsB > violationsA ? "CLASSROOM B" : "EQUAL/NONE");
+
+            let csv = "--- CLASSROOM NOISE INTELLIGENCE FINAL REPORT ---\n";
+            csv += `Final Verdict, ${verdict} was the noisier room\n`;
+            csv += `Room A Total Spikes, ${violationsA}\n`;
+            csv += `Room B Total Spikes, ${violationsB}\n`;
+            csv += `Average Noise Level, Room A: ${avgA} | Room B: ${avgB}\n`;
+            csv += "--------------------------------------------------\n\n";
+            csv += "Time, Room A, Room B, Alert Status\n";
+            
+            dataSession.forEach(entry => {
+                let status = (entry.a > currentThreshold || entry.b > currentThreshold) ? "ALERT" : "NORMAL";
+                csv += `${entry.t}, ${entry.a}, ${entry.b}, ${status}\n`;
+            });
+
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.setAttribute('href', url);
+            a.setAttribute('download', 'Classroom_Final_Report.csv');
+            a.click();
+        }
+
+        function addHeatmapTick(room) {
+            const now = new Date();
+            const pct = ((now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400) * 100;
+            const tick = document.createElement('div');
+            tick.className = 'noise-tick';
+            tick.style.left = pct + "%";
+            tick.style.color = room === 'A' ? 'cyan' : 'magenta';
+            tick.style.backgroundColor = 'currentColor';
+            document.getElementById('heatmapAxis').appendChild(tick);
+        }
+
+        function addHistoryRow(room, val, time) {
+            const now = Date.now();
+            if (now - lastAlertTime < 2000) return; 
+            lastAlertTime = now;
+            const tbody = document.getElementById('historyBody');
+            const row = tbody.insertRow(0);
+            row.innerHTML = `<td>${time}</td><td style="color:${room === 'Room A' ? 'cyan' : 'magenta'}">${room}</td><td>${val}</td><td style="color:#ff4d4d">Threshold Exceeded</td>`;
+        }
+
+        const ctx = document.getElementById('liveChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'Room A', borderColor: 'cyan', data: [], fill: false, tension: 0.4 }, { label: 'Room B', borderColor: 'magenta', data: [], fill: false, tension: 0.4 }] },
+            options: { responsive: true, scales: { y: { beginAtZero: true, grid: { color: '#333' } } } }
+        });
+
+        socket.on('soundData', (data) => {
+            // Save to memory for CSV
+            dataSession.push({t: data.timestamp, a: data.roomA, b: data.roomB});
+
+            if(data.roomA > maxA) { maxA = data.roomA; document.getElementById('peakA').innerText = maxA; }
+            if(data.roomB > maxB) { maxB = data.roomB; document.getElementById('peakB').innerText = maxB; }
+
+            const alertCard = document.getElementById('statusAlert');
+            const conclusion = document.getElementById('conclusionText');
+            let alertActive = false;
+
+            if (data.roomA > currentThreshold || data.roomB > currentThreshold) {
+                alertActive = true;
+                if (data.roomA > data.roomB) {
+                    conclusion.innerText = "CLASSROOM A"; conclusion.style.color = "cyan";
+                    violationsA++; document.getElementById('countA').innerText = violationsA;
+                    addHeatmapTick('A');
+                } else {
+                    conclusion.innerText = "CLASSROOM B"; conclusion.style.color = "magenta";
+                    violationsB++; document.getElementById('countB').innerText = violationsB;
+                    addHeatmapTick('B');
+                }
+            } else {
+                conclusion.innerText = "NONE"; conclusion.style.color = "#555";
+            }
+
+            if (data.roomA > currentThreshold) addHistoryRow('Room A', data.roomA, data.timestamp);
+            if (data.roomB > currentThreshold) addHistoryRow('Room B', data.roomB, data.timestamp);
+
+            if(alertActive) { alertCard.classList.add('alert-active'); alertCard.innerText = "⚠️ NOISE ALERT!"; } 
+            else { alertCard.classList.remove('alert-active'); alertCard.innerText = "SYSTEM CALIBRATED"; }
+
+            if (chart.data.labels.length > 20) {
+                chart.data.labels.shift();
+                chart.data.datasets[0].data.shift();
+                chart.data.datasets[1].data.shift();
+            }
+            chart.data.labels.push(data.timestamp);
+            chart.data.datasets[0].data.push(data.roomA);
+            chart.data.datasets[1].data.push(data.roomB);
+            chart.update('none');
+        });
+    </script>
+</body>
+</html>
